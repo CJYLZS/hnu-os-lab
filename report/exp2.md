@@ -225,8 +225,7 @@ default_free_pages主要完成的是对于页的释放操作。
 
 对原有的算法进行了优化
 
-暂时没发现有可以改进的空间
-
+我们可以用二叉搜索树来对内存进行管理。用二叉搜索树主要是通过对地址排序，使得在使用free时候可以在O(logn)时间内完成链表项位置的查找，从而实现时间上的优化。
 # **练习2：实现寻找虚拟地址对应的页表项（需要编程）**
 
 
@@ -466,3 +465,220 @@ pte_t 全称为page table entry，表示二级页表的表项，中10位。
 ![figure/exp2-pic1.png](figure/exp2-pic1.png)
 
 测试结果正确 得分为满分
+
+# 扩展练习 伙伴分配算法
+
+```C
+/*
+free_area.free_list中的内存块顺序:
+
+1. 一大块连续物理内存被切割后，free_area.free_list中的内存块顺序
+    addr: 0x34       0x38           0x40
+        +----+     +--------+     +---------------+
+    <-> | 0x4| <-> | 0x8    | <-> |     0x10      | <->
+        +----+     +--------+     +---------------+
+
+2. 几大块物理内存（这几块之间可能不连续）被切割后，free_area.free_list中的内存块顺序
+    addr: 0x34       0x104       0x38           0x108          0x40                 0x110
+        +----+     +----+     +--------+     +--------+     +---------------+     +---------------+
+    <-> | 0x4| <-> | 0x4| <-> | 0x8    | <-> | 0x8    | <-> |     0x10      | <-> |     0x10      | <->
+        +----+     +----+     +--------+     +--------+     +---------------+     +---------------+
+*/
+```
+
+编写初始化函数如下
+
+```C
+static void
+buddy_init_memmap(struct Page *base, size_t n) {
+    assert(n > 0);
+
+    
+    struct Page *p = base;
+    for (; p != base + n; p ++) {
+        assert(PageReserved(p));
+        p->flags = p->property = 0;
+        set_page_ref(p, 0);
+    }
+    nr_free += n;
+    base += n;
+    while(n != 0)
+    {
+        size_t curr_n = getLessNearOfPower2(n);
+        base -= curr_n;
+        base->property = curr_n;
+        SetPageProperty(base);
+        list_entry_t* le;
+        for(le = list_next(&free_list); le != &free_list; le = list_next(le))
+        {
+            struct Page *p = le2page(le, page_link);
+            
+            if((p->property > base->property)
+                 || (p->property ==  base->property && p > base))
+                break;
+        }
+        list_add_before(le, &(base->page_link));
+        n -= curr_n;
+    }
+}
+```
+编写分配空间的函数如下
+
+```C
+static struct Page *
+buddy_alloc_pages(size_t n) {
+    assert(n > 0);
+    
+    size_t lessOfPower2 = getLessNearOfPower2(n);
+    if (lessOfPower2 < n)
+        n = 2 * lessOfPower2;
+    
+    if (n > nr_free) {
+        return NULL;
+    }
+    // 寻找一块合适的内存块
+    struct Page *page = NULL;
+    list_entry_t *le = &free_list;
+    while ((le = list_next(le)) != &free_list) {
+        struct Page *p = le2page(le, page_link);
+        if (p->property >= n) {
+            page = p;
+            break;
+        }
+    }
+    
+    if (page != NULL) {
+        // 切割内存块
+        while(page->property > n)
+        {
+            page->property /= 2;
+            struct Page *p = page + page->property;
+            p->property = page->property;
+            SetPageProperty(p);
+            list_add_after(&(page->page_link), &(p->page_link));
+        }
+        nr_free -= n;
+        ClearPageProperty(page);
+        assert(page->property == n);
+        list_del(&(page->page_link));
+    }
+    return page;
+}
+```
+
+
+编写内存释放函数如下
+
+```C
+static void
+buddy_free_pages(struct Page *base, size_t n) {
+    assert(n > 0);
+    
+    size_t lessOfPower2 = getLessNearOfPower2(n);
+    if (lessOfPower2 < n)
+        n = 2 * lessOfPower2;
+    struct Page *p = base;
+    for (; p != base + n; p ++) {
+        assert(!PageReserved(p) && !PageProperty(p));
+        p->flags = 0;
+        set_page_ref(p, 0);
+    }
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+    list_entry_t *le;
+    // 插入双向链表
+    for(le = list_next(&free_list); le != &free_list; le = list_next(le))
+    {
+        p = le2page(le, page_link);
+        if ((base->property < p->property)
+                 || (p->property ==  base->property && p > base)) {
+            break;
+        }
+    }
+    list_add_before(le, &(base->page_link));
+    // 向左合并
+    if(base->property == p->property && p + p->property == base) {
+        p->property += base->property;
+        ClearPageProperty(base);
+        list_del(&(base->page_link));
+        base = p;
+        le = &(base->page_link);
+    }
+    // 向右合并
+    while (le != &free_list) {
+        p = le2page(le, page_link);
+        if (base->property == p->property && base + base->property == p)
+        {
+            base->property += p->property;
+            ClearPageProperty(p);
+            list_del(&(p->page_link));
+            le = &(base->page_link);
+        }
+        else if(base->property < p->property)
+        {
+            list_entry_t* targetLe = list_next(&base->page_link);
+            while(le2page(targetLe, page_link)->property < base->property)
+                targetLe = list_next(targetLe);
+            if(targetLe != list_next(&base->page_link))
+            {
+                list_del(&(base->page_link));
+                list_add_before(targetLe, &(base->page_link));
+            }
+            break;
+        }
+        le = list_next(le);
+    }
+}
+```
+
+最后编写检查代码如下
+
+```C
+//.........................................................
+// 先释放
+free_pages(p0, 26);     // 32+  (-:已分配 +: 已释放)
+// 首先检查是否对齐2
+p0 = alloc_pages(6);    // 8- 8+ 16+
+p1 = alloc_pages(10);   // 8- 8+ 16-
+assert((p0 + 8)->property == 8);
+free_pages(p1, 10);     // 8- 8+ 16+
+assert((p0 + 8)->property == 8);
+assert(p1->property == 16);
+p1 = alloc_pages(16);   // 8- 8+ 16-
+// 之后检查合并
+free_pages(p0, 6);      // 16+ 16-
+assert(p0->property == 16);
+free_pages(p1, 16);     // 32+
+assert(p0->property == 32);
+
+p0 = alloc_pages(8);    // 8- 8+ 16+
+p1 = alloc_pages(9);    // 8- 8+ 16-
+free_pages(p1, 9);     // 8- 8+ 16+
+assert(p1->property == 16);
+assert((p0 + 8)->property == 8);
+free_pages(p0, 8);      // 32+
+assert(p0->property == 32);
+// 检测链表顺序是否按照块的大小排序的
+p0 = alloc_pages(5);
+p1 = alloc_pages(16);
+free_pages(p1, 16);
+assert(list_next(&(free_list)) == &((p1 - 8)->page_link));
+free_pages(p0, 5);
+assert(list_next(&(free_list)) == &(p0->page_link));
+
+p0 = alloc_pages(5);
+p1 = alloc_pages(16);
+free_pages(p0, 5);
+assert(list_next(&(free_list)) == &(p0->page_link));
+free_pages(p1, 16);
+assert(list_next(&(free_list)) == &(p0->page_link));
+
+// 还原
+p0 = alloc_pages(26);
+//.........................................................
+```
+
+![](./figure/exp2-pic2.png)
+
+实验成功
