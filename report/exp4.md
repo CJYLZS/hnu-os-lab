@@ -333,6 +333,101 @@ proc_init(void) {
 
 # 扩展练习 实现支持任意大小的内存分配算法
 
+运行说明
+在Lab4的源代码中给出的SLOB算法实际上是First-Fit算法，因此我此次实现的任意大小内存分配算法为Best-Fit算法，主要修改了slob_alloc函数。
 
+为了测试代码实现的正确性，仅仅需要执行命令 make score 查看运行结果
 
- 
+实现思路
+首先确定所实现kmalloc在uCore内存管理中所处的地位，才能更好地理解函数调用关系。
+
+在内核中，uCore的内存管理分为物理内存管理pmm和虚拟内存管理vmm。虚拟内存管理模块只负责管理页式地址映射关系，不负责具体的内存分配。而物理内存管理模块pmm不仅要管理连续的物理内存，还要能够向上提供分配内存的接口alloc_pages，分配出的物理内存区域可以转换为内核态可访问的区域（只要偏移KERNBASE）即可；也可以做地址映射转换给用户态程序使用。
+
+但是，alloc_pages仅仅提供以页为粒度的物理内存分配，在uCore内核中，会频繁分配小型动态的数据结构（诸如vma_struct和proc_struct），这样以页为粒度进行分配既不节省空间，速度还慢，需要有一个接口能够提供更加细粒度的内存分配与释放工作，这就是slab和slob出现的原因：他们是一个中间件，底层调用alloc_pages接口，上层提供kmalloc接口，内部通过一系列机制管理页和内存小块的关系
+
+仔细阅读Lab4中原有的slob代码，在每个小块内存的头部都存放了该块的大小和下一个空闲块的地址。kmalloc函数会首先判断需要分配的空间是否跨页，如果是则直接调用alloc_pages进行分配，否则就调用slob_alloc进行分配。
+
+具体到Best-Fit算法的实现，实际很简单，仅仅需要在扫描空闲链表的时候动态记录与更新最好的块的地址即可，扫描完成之后，再选出刚刚找到的最合适的空间进行分配即可。无论是First-Fit、Best-Fit还是Worst-Fit，其释放的合并策略都是相同的，因此只需要修改slob_alloc函数即可。
+
+实验代码
+```C
+static void *slob_alloc(size_t size, gfp_t gfp, int align)
+{
+	assert( (size + SLOB_UNIT) < PAGE_SIZE );
+	// This best fit allocator does not consider situations where align != 0
+	assert(align == 0);
+	int units = SLOB_UNITS(size);
+
+	unsigned long flags;
+	spin_lock_irqsave(&slob_lock, flags);
+
+	slob_t *prev = slobfree, *cur = slobfree->next;
+	int find_available = 0;
+	int best_frag_units = 100000;
+	slob_t *best_slob = NULL;
+	slob_t *best_slob_prev = NULL;
+
+	for (; ; prev = cur, cur = cur->next) {
+		if (cur->units >= units) {
+			// Find available one.
+			if (cur->units == units) {
+				// If found a perfect one...
+				prev->next = cur->next;
+				slobfree = prev;
+				spin_unlock_irqrestore(&slob_lock, flags);
+				// That's it!
+				return cur;
+			}
+			else {
+				// This is not a prefect one.
+				if (cur->units - units < best_frag_units) {
+					// This seems to be better than previous one.
+					best_frag_units = cur->units - units;
+					best_slob = cur;
+					best_slob_prev = prev;
+					find_available = 1;
+				}
+			}
+
+		}
+
+		// Get to the end of iteration.
+		if (cur == slobfree) {
+			if (find_available) {
+				// use the found best fit.
+				best_slob_prev->next = best_slob + units;
+				best_slob_prev->next->units = best_frag_units;
+				best_slob_prev->next->next = best_slob->next;
+				best_slob->units = units;
+				slobfree = best_slob_prev;
+				spin_unlock_irqrestore(&slob_lock, flags);
+				// That's it!
+				return best_slob;
+			}
+			// Initially, there's no available arena. So get some.
+			spin_unlock_irqrestore(&slob_lock, flags);
+			if (size == PAGE_SIZE) return 0;
+
+			cur = (slob_t *)__slob_get_free_page(gfp);
+			if (!cur) return 0;
+
+			slob_free(cur, PAGE_SIZE);
+			spin_lock_irqsave(&slob_lock, flags);
+			cur = slobfree;
+		}
+	}
+}
+```
+
+```shell
+-> % make grade              
+Check VMM:               (s)
+  -check pmm:                                OK
+  -check page table:                         OK
+  -check slab:                               OK
+  -check vmm:                                OK
+  -check swap page fault:                    OK
+  -check ticks:                              OK
+  -check initproc:                           OK
+Total Score: 100/100
+```
