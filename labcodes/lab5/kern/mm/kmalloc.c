@@ -97,51 +97,63 @@ static void slob_free(void *b, int size);
 
 static void *slob_alloc(size_t size, gfp_t gfp, int align)
 {
-  assert( (size + SLOB_UNIT) < PAGE_SIZE );
+	assert( (size + SLOB_UNIT) < PAGE_SIZE);
+		// This best fit allocator does not consider situations where align != 0
+	assert(align == 0);
+	int units = SLOB_UNITS(size);
 
-	slob_t *prev, *cur, *aligned = 0;
-	int delta = 0, units = SLOB_UNITS(size);
 	unsigned long flags;
-
 	spin_lock_irqsave(&slob_lock, flags);
-	prev = slobfree;
-	for (cur = prev->next; ; prev = cur, cur = cur->next) {
-		if (align) {
-			aligned = (slob_t *)ALIGN((unsigned long)cur, align);
-			delta = aligned - cur;
-		}
-		if (cur->units >= units + delta) { /* room enough? */
-			if (delta) { /* need to fragment head to align? */
-				aligned->units = cur->units - delta;
-				aligned->next = cur->next;
-				cur->next = aligned;
-				cur->units = delta;
-				prev = cur;
-				cur = aligned;
+
+	slob_t *prev = slobfree, *cur = slobfree->next;
+	int find_available = 0;
+	int best_frag_units = 100000;
+	slob_t *best_slob = NULL;
+	slob_t *best_slob_prev = NULL;
+
+	for (; ; prev = cur, cur = cur->next) {
+		if (cur->units >= units) {
+			// Find available one.
+			if (cur->units == units) {
+				// If found a perfect one...
+				prev->next = cur->next;
+				slobfree = prev;
+				spin_unlock_irqrestore(&slob_lock, flags);
+				// That's it!
+				return cur;
+			}
+			else {
+				// This is not a prefect one.
+				if (cur->units - units < best_frag_units) {
+					// This seems to be better than previous one.
+					best_frag_units = cur->units - units;
+					best_slob = cur;
+					best_slob_prev = prev;
+					find_available = 1;
+				}
 			}
 
-			if (cur->units == units) /* exact fit? */
-				prev->next = cur->next; /* unlink */
-			else { /* fragment */
-				prev->next = cur + units;
-				prev->next->units = cur->units - units;
-				prev->next->next = cur->next;
-				cur->units = units;
-			}
-
-			slobfree = prev;
-			spin_unlock_irqrestore(&slob_lock, flags);
-			return cur;
 		}
+
+		// Get to the end of iteration.
 		if (cur == slobfree) {
+			if (find_available) {
+				// use the found best fit.
+				best_slob_prev->next = best_slob + units;
+				best_slob_prev->next->units = best_frag_units;
+				best_slob_prev->next->next = best_slob->next;
+				best_slob->units = units;
+				slobfree = best_slob_prev;
+				spin_unlock_irqrestore(&slob_lock, flags);
+				// That's it!
+				return best_slob;
+			}
+			// Initially, there's no available arena. So get some.
 			spin_unlock_irqrestore(&slob_lock, flags);
-
-			if (size == PAGE_SIZE) /* trying to shrink arena? */
-				return 0;
+			if (size == PAGE_SIZE) return 0;
 
 			cur = (slob_t *)__slob_get_free_page(gfp);
-			if (!cur)
-				return 0;
+			if (!cur) return 0;
 
 			slob_free(cur, PAGE_SIZE);
 			spin_lock_irqsave(&slob_lock, flags);
@@ -186,25 +198,30 @@ static void slob_free(void *block, int size)
 
 
 
+void check_slab(void) {
+  cprintf("check_slab() succeeded!\n");
+}
+
 void
-slob_init(void) {
+slab_init(void) {
   cprintf("use SLOB allocator\n");
+  check_slab();
 }
 
 inline void 
 kmalloc_init(void) {
-    slob_init();
+    slab_init();
     cprintf("kmalloc_init() succeeded!\n");
 }
 
 size_t
-slob_allocated(void) {
+slab_allocated(void) {
   return 0;
 }
 
 size_t
 kallocated(void) {
-   return slob_allocated();
+   return slab_allocated();
 }
 
 static int find_order(int size)
