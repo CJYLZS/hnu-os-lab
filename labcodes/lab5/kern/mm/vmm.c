@@ -510,6 +510,22 @@ do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr) {
             //we didn't implement now, we will do it in future.
             panic("error write a non-writable pte");
             //page = pte2page(*ptep);
+            // 原先所使用的只读物理页
+            page = pte2page(*ptep);
+            // 如果该物理页面被多个进程引用
+            if(page_ref(page) > 1)
+            {
+                // 释放当前PTE的引用并分配一个新物理页
+                struct Page* newPage = pgdir_alloc_page(mm->pgdir, addr, perm);
+                void * kva_src = page2kva(page);
+                void * kva_dst = page2kva(newPage);
+                // 拷贝数据
+                memcpy(kva_dst, kva_src, PGSIZE);
+            }
+            // 如果该物理页面只被当前进程所引用,即page_ref等1
+            else
+                // 则可以直接执行page_insert，保留当前物理页并重设其PTE权限。
+                page_insert(mm->pgdir, page, addr, perm);
         } else{
            // if this pte is a swap entry, then load data from disk to a page with phy addr
            // and call page_insert to map the phy addr with logical addr

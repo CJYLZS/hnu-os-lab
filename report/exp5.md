@@ -609,3 +609,309 @@ Total Score: 150/150
 
 
 # 扩展练习 Challenge ：实现 Copy on Write 机制
+
+首先学习什么是copy on write机制：
+
+**写时复制**（**Copy-on-write**，简称**COW**）其核心思想是，如果有多个调用者（callers）同时请求相同资源（如内存或磁盘上的数据存储），他们会共同获取相同的指针指向相同的资源，直到某个调用者试图修改资源的内容时，系统才会真正复制一份专用副本（private copy）给该调用者，而其他调用者所见到的最初的资源仍然保持不变。这过程对其他的调用者都是[透明](https://zh.wikipedia.org/wiki/透明)的。此作法主要的优点是如果调用者没有修改该资源，就不会有副本（private copy）被创建，因此多个调用者只是读取操作时可以共享同一份资源。
+
+
+
+也就是说 在fork调用创建新进程时 不直接复制一块新的内存空间 而共享父进程的内存空间 为了保证父进程正常运行 需要新进程对这段内存权限设置为只读
+
+如果新进程需要在这段共享内存内写入新数据 则在操作系统内部就会由于写只读内存引发页错误 在页错误处理函数中 可以进行判断 如果是这种情况导致的页错误 那么再采取拷贝原有内存的方式为这个新进程写入新的数据
+
+这样的好处就是如果新进程不需要在原有内存中写入新数据 那么使用共享内存就会大大提高性能 因为不需要复制内存的开销 并且可以节省内存占用 因为多个进程使用了同一段共享内存
+
+实现方式如下
+
+首先需要修改copy_range函数 在share为1的情况下 执行写时复制 而不是分配新的内存空间并完全拷贝原有进程的数据
+
+```c
+/* copy_range - copy content of memory (start, end) of one process A to another process B
+ * @to:    the addr of process B's Page Directory
+ * @from:  the addr of process A's Page Directory
+ * @share: flags to indicate to dup OR share. We just use dup method, so it didn't be used.
+ *
+ * CALL GRAPH: copy_mm-->dup_mmap-->copy_range
+ */
+int
+copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share) {
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+    // copy content by page unit.
+    do {
+        //call get_pte to find process A's pte according to the addr start
+        pte_t *ptep = get_pte(from, start, 0), *nptep;
+        if (ptep == NULL) {
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue ;
+        }
+        //call get_pte to find process B's pte according to the addr start. If pte is NULL, just alloc a PT
+        if (*ptep & PTE_P) {
+            if ((nptep = get_pte(to, start, 1)) == NULL) {
+                return -E_NO_MEM;
+            }
+            uint32_t perm = (*ptep & PTE_USER);
+            //get page from ptep
+            struct Page *page = pte2page(*ptep);
+            int ret=0;
+            if(share){
+                // lab5 challenge
+                // if use COW
+                cprintf("Sharing the page 0x%x\n", page2kva(page));
+                // 物理页面共享，并设置两个PTE上的标志位为只读
+                page_insert(from, page, start, perm & ~PTE_W);
+                ret = page_insert(to, page, start, perm & ~PTE_W);
+            }else{
+                // alloc a page for process B
+                struct Page *npage=alloc_page();
+                assert(page!=NULL);
+                assert(npage!=NULL);
+                
+                /* LAB5:EXERCISE2 YOUR CODE
+                * replicate content of page to npage, build the map of phy addr of nage with the linear addr start
+                *
+                * Some Useful MACROs and DEFINEs, you can use them in below implementation.
+                * MACROs or Functions:
+                *    page2kva(struct Page *page): return the kernel vritual addr of memory which page managed (SEE pmm.h)
+                *    page_insert: build the map of phy addr of an Page with the linear addr la
+                *    memcpy: typical memory copy function
+                *
+                * (1) find src_kvaddr: the kernel virtual address of page
+                * (2) find dst_kvaddr: the kernel virtual address of npage
+                * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
+                * (4) build the map of phy addr of  nage with the linear addr start
+                */
+                void * kva_src = page2kva(page);
+                void * kva_dst = page2kva(npage);
+            
+                memcpy(kva_dst, kva_src, PGSIZE);
+
+                ret = page_insert(to, npage, start, perm);
+            }
+            assert(ret == 0);
+        }
+        start += PGSIZE;
+    } while (start != 0 && start < end);
+    return 0;
+}
+```
+
+修改do_pgfalut函数 处理发生写入只读页面造成的页错误
+
+```c
+int
+do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr) {
+    int ret = -E_INVAL;
+    //try to find a vma which include addr
+    struct vma_struct *vma = find_vma(mm, addr);
+
+    pgfault_num++;
+    //If the addr is in the range of a mm's vma?
+    if (vma == NULL || vma->vm_start > addr) {
+        cprintf("not valid addr %x, and  can not find it in vma\n", addr);
+        goto failed;
+    }
+    //check the error_code
+    switch (error_code & 3) {
+    default:
+            /* error code flag : default is 3 ( W/R=1, P=1): write, present */
+    case 2: /* error code flag : (W/R=1, P=0): write, not present */
+        if (!(vma->vm_flags & VM_WRITE)) {
+            cprintf("do_pgfault failed: error code flag = write AND not present, but the addr's vma cannot write\n");
+            goto failed;
+        }
+        break;
+    case 1: /* error code flag : (W/R=0, P=1): read, present */
+        cprintf("do_pgfault failed: error code flag = read AND present\n");
+        goto failed;
+    case 0: /* error code flag : (W/R=0, P=0): read, not present */
+        if (!(vma->vm_flags & (VM_READ | VM_EXEC))) {
+            cprintf("do_pgfault failed: error code flag = read AND not present, but the addr's vma cannot read or exec\n");
+            goto failed;
+        }
+    }
+    /* IF (write an existed addr ) OR
+     *    (write an non_existed addr && addr is writable) OR
+     *    (read  an non_existed addr && addr is readable)
+     * THEN
+     *    continue process
+     */
+    uint32_t perm = PTE_U;
+    if (vma->vm_flags & VM_WRITE) {
+        perm |= PTE_W;
+    }
+    addr = ROUNDDOWN(addr, PGSIZE);
+
+    ret = -E_NO_MEM;
+
+    pte_t *ptep=NULL;
+    /*LAB3 EXERCISE 1: YOUR CODE
+    * Maybe you want help comment, BELOW comments can help you finish the code
+    *
+    * Some Useful MACROs and DEFINEs, you can use them in below implementation.
+    * MACROs or Functions:
+    *   get_pte : get an pte and return the kernel virtual address of this pte for la
+    *             if the PT contians this pte didn't exist, alloc a page for PT (notice the 3th parameter '1')
+    *   pgdir_alloc_page : call alloc_page & page_insert functions to allocate a page size memory & setup
+    *             an addr map pa<--->la with linear address la and the PDT pgdir
+    * DEFINES:
+    *   VM_WRITE  : If vma->vm_flags & VM_WRITE == 1/0, then the vma is writable/non writable
+    *   PTE_W           0x002                   // page table/directory entry flags bit : Writeable
+    *   PTE_U           0x004                   // page table/directory entry flags bit : User can access
+    * VARIABLES:
+    *   mm->pgdir : the PDT of these vma
+    *
+    */
+#if 0
+    /*LAB3 EXERCISE 1: YOUR CODE*/
+    ptep = ???              //(1) try to find a pte, if pte's PT(Page Table) isn't existed, then create a PT.
+    if (*ptep == 0) {
+                            //(2) if the phy addr isn't exist, then alloc a page & map the phy addr with logical addr
+
+    }
+    else {
+    /*LAB3 EXERCISE 2: YOUR CODE
+    * Now we think this pte is a  swap entry, we should load data from disk to a page with phy addr,
+    * and map the phy addr with logical addr, trigger swap manager to record the access situation of this page.
+    *
+    *  Some Useful MACROs and DEFINEs, you can use them in below implementation.
+    *  MACROs or Functions:
+    *    swap_in(mm, addr, &page) : alloc a memory page, then according to the swap entry in PTE for addr,
+    *                               find the addr of disk page, read the content of disk page into this memroy page
+    *    page_insert ： build the map of phy addr of an Page with the linear addr la
+    *    swap_map_swappable ： set the page swappable
+    */
+        if(swap_init_ok) {
+            struct Page *page=NULL;
+                                    //(1）According to the mm AND addr, try to load the content of right disk page
+                                    //    into the memory which page managed.
+                                    //(2) According to the mm, addr AND page, setup the map of phy addr <---> logical addr
+                                    //(3) make the page swappable.
+        }
+        else {
+            cprintf("no swap_init_ok but ptep is %x, failed\n",*ptep);
+            goto failed;
+        }
+   }
+#endif
+    // try to find a pte, if pte's PT(Page Table) isn't existed, then create a PT.
+    // (notice the 3th parameter '1')
+    ptep = get_pte(mm->pgdir, addr, 1);
+    if (ptep == NULL) {
+        cprintf("get_pte in do_pgfault failed\n");
+        goto failed;
+    }
+    
+    if (*ptep == 0) { 
+        // if the phy addr isn't exist, then alloc a page & map the phy addr with logical addr
+        if (pgdir_alloc_page(mm->pgdir, addr, perm) == NULL) {
+            cprintf("pgdir_alloc_page in do_pgfault failed\n");
+            goto failed;
+        }
+    }
+    else { 
+        struct Page *page=NULL;
+        if(*ptep & PTE_P){
+            // 如果当前页错误的原因是写入了只读页面
+            // 写时复制：复制一块内存给当前进程
+            cprintf("\n\nCOW: ptep 0x%x, pte 0x%x\n",ptep, *ptep);
+            // 原先所使用的只读物理页
+            page = pte2page(*ptep);
+            // 如果该物理页面被多个进程引用
+            if(page_ref(page) > 1)
+            {
+                // 释放当前PTE的引用并分配一个新物理页
+                struct Page* newPage = pgdir_alloc_page(mm->pgdir, addr, perm);
+                void * kva_src = page2kva(page);
+                void * kva_dst = page2kva(newPage);
+                // 拷贝数据
+                memcpy(kva_dst, kva_src, PGSIZE);
+            }
+            // 如果该物理页面只被当前进程所引用,即page_ref等1
+            else
+                // 则可以直接执行page_insert，保留当前物理页并重设其PTE权限。
+                page_insert(mm->pgdir, page, addr, perm);
+
+        }else{
+            // if this pte is a swap entry, then load data from disk to a page with phy addr
+            // and call page_insert to map the phy addr with logical addr
+            if(swap_init_ok) {
+                
+                ret = swap_in(mm, addr, &page);
+                if (ret != 0) {
+                    cprintf("swap_in in do_pgfault failed\n");
+                    goto failed;
+                }    
+                page_insert(mm->pgdir, page, addr, perm);
+                swap_map_swappable(mm, addr, page, 1);
+                page->pra_vaddr = addr;
+            }
+            else {
+                cprintf("no swap_init_ok but ptep is %x, failed\n",*ptep);
+                goto failed;
+            }
+        }
+
+   }
+   ret = 0;
+failed:
+    return ret;
+}
+```
+
+
+
+测试：
+
+```shell
+-> % make grade
+badsegment:              (s)
+  -check result:                             OK
+  -check output:                             OK
+divzero:                 (s)
+  -check result:                             OK
+  -check output:                             OK
+softint:                 (s)
+  -check result:                             OK
+  -check output:                             OK
+faultread:               (s)
+  -check result:                             OK
+  -check output:                             OK
+faultreadkernel:         (s)
+  -check result:                             OK
+  -check output:                             OK
+hello:                   (s)
+  -check result:                             OK
+  -check output:                             OK
+testbss:                 (s)
+  -check result:                             OK
+  -check output:                             OK
+pgdir:                   (s)
+  -check result:                             OK
+  -check output:                             OK
+yield:                   (s)
+  -check result:                             OK
+  -check output:                             OK
+badarg:                  (s)
+  -check result:                             OK
+  -check output:                             OK
+exit:                    (s)
+  -check result:                             OK
+  -check output:                             OK
+spin:                    (s)
+  -check result:                             OK
+  -check output:                             OK
+waitkill:                (s)
+  -check result:                             OK
+  -check output:                             OK
+forktest:                (s)
+  -check result:                             OK
+  -check output:                             OK
+forktree:                (s)
+  -check result:                             OK
+  -check output:                             OK
+Total Score: 150/150
+```
+
+没有出现问题 说明实验成功
