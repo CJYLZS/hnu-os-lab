@@ -42,6 +42,8 @@ struct run_queue {
     int max_time_slice;
     // For LAB6 ONLY
     skew_heap_entry_t *lab6_run_pool;
+    //CFS
+    skew_heap_entry_t *fair_run_pool;
 };
 
 void sched_init(void);
