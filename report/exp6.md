@@ -429,3 +429,259 @@ Total Score: 170/170
 
 # challenge 实现 Linux 的 CFS 调度算法
 
+实现 Linux 的 CFS 调度算法
+
+- CFS调度算法原理
+
+CFS 算法的基本思路就是尽量使得每个进程的运行时间相同，所以需要记录每个进程已经运行的时间：
+
+```c
+struct proc_struct {
+	...
+    int fair_run_time;                          // FOR CFS ONLY: run time
+};
+```
+
+每次调度的时候，选择已经运行时间最少的进程。所以，也就需要一个数据结构来快速获得最少运行时间的进程， CFS 算法选择的是红黑树，但是项目中的斜堆也可以实现，只是性能不及红黑树。CFS是对于**优先级**的实现方法就是让优先级低的进程的时间过得很快。
+
+#### (1) 数据结构
+
+首先需要在 run_queue 增加一个斜堆：
+
+```c
+struct run_queue {
+    list_entry_t run_list;
+    unsigned int proc_num;
+    int max_time_slice;
+    // For LAB6 ONLY
+    skew_heap_entry_t *lab6_run_pool;
+    //CFS
+    skew_heap_entry_t *fair_run_pool;
+};
+```
+
+在 proc_struct 中增加三个成员：
+
+- 虚拟运行时间：fair_run_time
+- 优先级系数：fair_priority，从 1 开始，数值越大，时间过得越快
+- 斜堆：fair_run_pool
+
+```c
+struct proc_struct {
+    enum proc_state state;                      // Process state
+    int pid;                                    // Process ID
+    int runs;                                   // the running times of Proces
+    uintptr_t kstack;                           // Process kernel stack
+    volatile bool need_resched;                 // bool value: need to be rescheduled to release CPU?
+    struct proc_struct *parent;                 // the parent process
+    struct mm_struct *mm;                       // Process's memory management field
+    struct context context;                     // Switch here to run process
+    struct trapframe *tf;                       // Trap frame for current interrupt
+    uintptr_t cr3;                              // CR3 register: the base addr of Page Directroy Table(PDT)
+    uint32_t flags;                             // Process flag
+    char name[PROC_NAME_LEN + 1];               // Process name
+    list_entry_t list_link;                     // Process link list 
+    list_entry_t hash_link;                     // Process hash list
+    int exit_code;                              // exit code (be sent to parent proc)
+    uint32_t wait_state;                        // waiting state
+    struct proc_struct *cptr, *yptr, *optr;     // relations between processes
+    struct run_queue *rq;                       // running queue contains Process
+    list_entry_t run_link;                      // the entry linked in run queue
+    int time_slice;                             // time slice for occupying the CPU
+    skew_heap_entry_t lab6_run_pool;            // FOR LAB6 ONLY: the entry in the run pool
+    uint32_t lab6_stride;                       // FOR LAB6 ONLY: the current stride of the process 
+    uint32_t lab6_priority;                     // FOR LAB6 ONLY: the priority of process, set by lab6_set_priority(uint32_t)
+    //CFS
+    int fair_run_time;
+    int fair_priority;
+    skew_heap_entry_t fair_run_pool;
+};
+```
+
+#### (2) 算法实现
+
+- ##### proc_fair_comp_f函数
+
+比较函数，用于比较两个任务的运行时间，确保红黑树可以排序得到`fair_run_time`最小的节点。
+
+首先需要一个比较函数，同样根据 [![img](https://camo.githubusercontent.com/31351a3e065c7672ff6ca40c36c1eb64b3c059d89981213f98cfd59766001de4/687474703a2f2f6c617465782e636f6465636f67732e636f6d2f6769662e6c617465783f4d41585f52554e54494d452d4d494e5f52554e5449452533434d41585f5052494f52495459)](https://camo.githubusercontent.com/31351a3e065c7672ff6ca40c36c1eb64b3c059d89981213f98cfd59766001de4/687474703a2f2f6c617465782e636f6465636f67732e636f6d2f6769662e6c617465783f4d41585f52554e54494d452d4d494e5f52554e5449452533434d41585f5052494f52495459) 完全不需要考虑虚拟运行时溢出的问题。
+
+```c
+static int proc_cfs_comp_f(void *a, void *b) {
+     struct proc_struct *p = le2proc(a, fair_run_pool);
+     struct proc_struct *q = le2proc(b, fair_run_pool);
+     int32_t c = p->fair_run_time - q->fair_run_time;
+     if (c > 0)
+    	 return 1;
+     else if (c == 0)
+    	 return 0;
+     else
+    	 return -1;
+}
+
+```
+
+- ##### fair_init
+
+初始化，初始化堆为空，proc_num进程数为０
+
+```c
+static void cfs_init(struct run_queue *rq) {
+    rq->fair_run_pool = NULL;
+    rq->proc_num = 0;
+}
+```
+
+- ##### fair_enqueue
+
+入堆，在将指定进程加入就绪队列的时候，需要调用斜堆的插入函数将其插入到斜堆中，然后对时间片等信息进行更新
+
+```c
+static void cfs_enqueue(struct run_queue *rq, struct proc_struct *proc) {
+    rq->fair_run_pool = skew_heap_insert(rq->fair_run_pool, &(proc->fair_run_pool), proc_cfs_comp_f);
+    if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice)
+        proc->time_slice = rq->max_time_slice;
+    proc->rq = rq;
+    rq->proc_num++;
+}
+```
+
+- ##### fair_dequeue
+
+出队列，将指定进程从就绪队列中删除，只需要将该进程从斜堆中删除掉即可。
+
+```c
+static void cfs_dequeue(struct run_queue *rq, struct proc_struct *proc) {
+    rq->fair_run_pool = skew_heap_remove(rq->fair_run_pool, &(proc->fair_run_pool), proc_cfs_comp_f);
+    rq->proc_num--;
+}
+```
+
+- ##### fair_pick_next
+
+选择调度函数，选择下一个要执行的进程，选择虚拟运行时`fair_run_time`最小的节点。
+
+```c
+static struct proc_struct *cfs_pick_next(struct run_queue *rq) {
+    if (rq->fair_run_pool == NULL)
+        return NULL;
+    skew_heap_entry_t *le = rq->fair_run_pool;
+    struct proc_struct * p = le2proc(le, fair_run_pool);
+    return p;
+}
+```
+
+- ##### fair_proc_tick
+
+时间片函数，需要更新虚拟运行时，增加的量为优先级系数。
+
+```c
+static void
+fair_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
+    if (proc->time_slice > 0) {			//到达时间片
+        proc->time_slice --;			//执行进程的时间片 time_slice 减一
+        proc->fair_run_time += proc->fair_priority;	//优先级系数：fair_priority，从 1 开始，数值越大，时间过得越快
+    }
+    if (proc->time_slice == 0) {		//时间片为 0，设置此进程成员变量 need_resched 标识为 1，进程需要调度
+        proc->need_resched = 1;
+    }
+}
+```
+
+#### 兼容调整
+
+为了保证测试可以通过，需要将 Stride Scheduling 的优先级对应到 CFS 的优先级：
+
+```c
+void lab6_set_priority(uint32_t priority)
+{
+    ...
+    // FOR CFS ONLY
+    current->fair_priority = 60 / current->lab6_priority + 1;	//
+    if (current->fair_priority < 1)
+        current->fair_priority = 1;		//设置此进程成员变量 need_resched 标识为 1，进程需要调度
+}
+```
+
+由于调度器需要通过虚拟运行时间确定下一个进程，如果虚拟运行时间最小的进程需要 yield ( )，那么必须增加虚拟运行时间
+
+例如可以增加一个时间片的运行时。
+
+```c
+int do_yield(void) {
+    ...
+    // FOR CFS ONLY
+    current->fair_run_time += current->rq->max_time_slice * current->fair_priority;
+    return 0;
+}
+```
+
+\##　我遇到的问题——数据结构
+
+> 为什么 CFS 调度算法使用红黑树而不使用堆来获取最小运行时进程？
+
+查阅了网上的资料以及自己分析，得到如下结论：
+
+- 堆基于数组，但是对于调度器来说进程数量不确定，无法使用定长数组实现的堆；
+- ucore 中的 Stride Scheduling 调度算法使用了斜堆，但是斜堆没有维护平衡的要求，可能导致斜堆退化成为有序链表，影响性能。
+
+综上所示，红黑树因为平衡性以及非连续所以是CFS算法最佳选择。
+
+
+
+```shell
+-> % make grade
+badsegment:              (s)
+  -check result:                             OK
+  -check output:                             OK
+divzero:                 (s)
+  -check result:                             OK
+  -check output:                             OK
+softint:                 (s)
+  -check result:                             OK
+  -check output:                             OK
+faultread:               (s)
+  -check result:                             OK
+  -check output:                             OK
+faultreadkernel:         (s)
+  -check result:                             OK
+  -check output:                             OK
+hello:                   (s)
+  -check result:                             OK
+  -check output:                             OK
+testbss:                 (s)
+  -check result:                             OK
+  -check output:                             OK
+pgdir:                   (s)
+  -check result:                             OK
+  -check output:                             OK
+yield:                   (s)
+  -check result:                             OK
+  -check output:                             OK
+badarg:                  (s)
+  -check result:                             OK
+  -check output:                             OK
+exit:                    (s)
+  -check result:                             OK
+  -check output:                             OK
+spin:                    (s)
+  -check result:                             OK
+  -check output:                             OK
+waitkill:                (s)
+  -check result:                             OK
+  -check output:                             OK
+forktest:                (s)
+  -check result:                             OK
+  -check output:                             OK
+forktree:                (s)
+  -check result:                             OK
+  -check output:                             OK
+matrix:                  (s)
+  -check result:                             OK
+  -check output:                             OK
+priority:                (s)
+  -check result:                             OK
+  -check output:                             OK
+Total Score: 170/170
+```
+

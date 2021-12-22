@@ -694,6 +694,8 @@ execve_exit:
 int
 do_yield(void) {
     current->need_resched = 1;
+    // FOR CFS ONLY
+    current->fair_run_time += current->rq->max_time_slice * current->fair_priority;
     return 0;
 }
 
@@ -899,4 +901,8 @@ lab6_set_priority(uint32_t priority)
     if (priority == 0)
         current->lab6_priority = 1;
     else current->lab6_priority = priority;
+    // FOR CFS ONLY
+    current->fair_priority = 60 / current->lab6_priority + 1;	//
+    if (current->fair_priority < 1)
+        current->fair_priority = 1;		//设置此进程成员变量 need_resched 标识为 1，进程需要调度
 }
