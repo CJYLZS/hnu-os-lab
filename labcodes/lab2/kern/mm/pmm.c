@@ -359,6 +359,22 @@ get_pte(pde_t *pgdir, uintptr_t la, bool create) {
     }
     return NULL;          // (8) return page table entry
 #endif
+    pde_t *pdep = &pgdir[PDX(la)];// get pde physical address from virtual address
+    // pgdir + offset pdep： 一级页表表项的指针
+
+    if(!(*pdep & PTE_P)){// not present 条目不可用
+        struct Page *page;
+        if (!create || (page = alloc_page()) == NULL){
+            // do not need to create new page OR allocate failed return NULL;
+            return NULL;
+        }
+        set_page_ref(page, 1);// reference count set to 1
+        uintptr_t pa = page2pa(page); // get the physical address of memory which this (struct Page *) page  manages
+        memset(KADDR(pa), 0, PGSIZE); // convert physical address to kernel virtual address
+        *pdep = pa | PTE_U | PTE_W | PTE_P; // Present, Writeable, User can access
+    }
+    // 返回在pgdir中对应于la的二级页表项
+    return &((pte_t *)KADDR(PDE_ADDR(*pdep)))[PTX(la)];
 }
 
 //get_page - get related Page struct for linear address la using PDT pgdir
@@ -404,6 +420,19 @@ page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep) {
                                   //(6) flush tlb
     }
 #endif
+    if (*ptep & PTE_P) { // if present
+
+        struct Page *page = pte2page(*ptep);// get the according page from the value of a ptep
+
+        if (page_ref_dec(page) == 0) {
+            // if reference count is zero free page
+            free_page(page);
+        }
+        // PTE clear
+        *ptep = 0;
+        // refresh tlb data
+        tlb_invalidate(pgdir, la);
+    }
 }
 
 //page_remove - free an Page which is related linear address la and has an validated pte

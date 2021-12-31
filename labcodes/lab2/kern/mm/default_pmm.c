@@ -116,7 +116,9 @@ default_init_memmap(struct Page *base, size_t n) {
     base->property = n;
     SetPageProperty(base);
     nr_free += n;
-    list_add(&free_list, &(base->page_link));
+    // list_add(&free_list, &(base->page_link));
+    // first-fit算法要求将空闲内存块按照地址从小到大的方式连起来。
+    list_add_before(&free_list, &(base->page_link));
 }
 
 static struct Page *
@@ -135,12 +137,23 @@ default_alloc_pages(size_t n) {
         }
     }
     if (page != NULL) {
+    //     list_del(&(page->page_link));
+    //     if (page->property > n) {
+    //         struct Page *p = page + n;
+    //         p->property = page->property - n;
+    //         list_add(&free_list, &(p->page_link));
+    // }
+    //     nr_free -= n;
+    //     ClearPageProperty(page);
+
+        // alloc n and replace original page
+        if (page->property > n){
+            struct Page *p = page + n;// only use 0..n-1
+            p->property = page->property - n;// page size decrease n
+            SetPageProperty(p);
+            list_add_after(&(page->page_link), &(p->page_link));
+        }
         list_del(&(page->page_link));
-        if (page->property > n) {
-            struct Page *p = page + n;
-            p->property = page->property - n;
-            list_add(&free_list, &(p->page_link));
-    }
         nr_free -= n;
         ClearPageProperty(page);
     }
@@ -162,11 +175,13 @@ default_free_pages(struct Page *base, size_t n) {
     while (le != &free_list) {
         p = le2page(le, page_link);
         le = list_next(le);
+        // space is after base
         if (base + base->property == p) {
             base->property += p->property;
             ClearPageProperty(p);
             list_del(&(p->page_link));
         }
+        // space is before base
         else if (p + p->property == base) {
             p->property += base->property;
             ClearPageProperty(base);
@@ -175,7 +190,19 @@ default_free_pages(struct Page *base, size_t n) {
         }
     }
     nr_free += n;
-    list_add(&free_list, &(base->page_link));
+    // list_add(&free_list, &(base->page_link));
+
+    le = list_next(&free_list);
+    // if can not merge find a position and add free link into free list
+    while (le != &free_list){
+        p = le2page(le, page_link);
+        if (base + base->property <= p){
+            assert(base + base->property != p);
+            break;
+        }
+        le = list_next(le);
+    }
+    list_add_before(le, &(base->page_link));
 }
 
 static size_t
