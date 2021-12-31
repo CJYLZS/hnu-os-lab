@@ -463,6 +463,6 @@ pte_t 全称为page table entry，表示二级页表的表项，中10位。
 
 # 结果测试：
 
-![image-20211125010015905](figure/exp2-pic1.png)
+![figure/exp2-pic1.png](figure/exp2-pic1.png)
 
 测试结果正确 得分为满分
